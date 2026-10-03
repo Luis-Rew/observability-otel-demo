@@ -1,0 +1,41 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Quando um log tem um campo "trace_id", o Grafana mostra um botão
+      # "TraceID" ao lado da linha de log que já abre o trace correspondente
+      # no Tempo — essa é a ponte de LOG para TRACE.
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: "\"trace_id\":\"(\\w+)\""
+          name: TraceID
+          url: "$${__value.raw}"
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # E esse é o caminho inverso: dentro de um trace no Tempo, o Grafana
+      # mostra um botão que já abre os logs daquele intervalo de tempo e
+      # serviço no Loki — a ponte de TRACE para LOG.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: true
+      serviceMap:
+        datasourceUid: prometheus

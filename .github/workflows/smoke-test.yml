@@ -1,0 +1,82 @@
+name: Smoke Test da Stack de Observabilidade
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Subir a stack (app + collector + Tempo + Prometheus + Loki + Promtail + Grafana)
+        run: docker compose up -d --build
+
+      - name: Esperar a API responder
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health > /dev/null; then
+              echo "API no ar."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::API não respondeu a tempo."
+          docker compose logs
+          exit 1
+
+      - name: Gerar tráfego de exemplo
+        run: |
+          for i in $(seq 1 10); do
+            curl -sS http://localhost:3000/tasks > /dev/null
+            curl -sS http://localhost:3000/tasks/1 > /dev/null
+            curl -sS -X POST http://localhost:3000/tasks -H "Content-Type: application/json" -d '{"title":"smoke test"}' > /dev/null
+            curl -sS http://localhost:3000/tasks/_chaos/simulate > /dev/null
+          done
+
+      # As três checagens a seguir são o coração deste projeto: confirmam que
+      # os três pilares da observabilidade estão realmente recebendo dados,
+      # não só que os containers subiram.
+      - name: Verificar que o Prometheus coletou métricas da API
+        run: |
+          sleep 10 # dar tempo para pelo menos um scrape (intervalo de 5s)
+          curl -sS "http://localhost:9090/api/v1/query?query=tasks_api_http_requests_total" | tee /tmp/prom.json
+          count=$(jq '.data.result | length' /tmp/prom.json)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Prometheus não tem a métrica tasks_api_http_requests_total."
+            exit 1
+          fi
+
+      - name: Verificar que o Tempo recebeu traces
+        run: |
+          curl -sS "http://localhost:3200/api/search?tags=service.name%3Dtasks-api" | tee /tmp/tempo.json
+          count=$(jq '.traces | length' /tmp/tempo.json)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Tempo não tem nenhum trace do serviço tasks-api."
+            exit 1
+          fi
+
+      - name: Verificar que o Loki recebeu logs com trace_id
+        run: |
+          curl -sS -G "http://localhost:3100/loki/api/v1/query_range" \
+            --data-urlencode 'query={container="tasks-api"} |= "trace_id"' \
+            --data-urlencode 'limit=5' | tee /tmp/loki.json
+          count=$(jq '[.data.result[].values[]] | length' /tmp/loki.json)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Loki não tem logs da tasks-api com trace_id."
+            exit 1
+          fi
+
+      - name: Logs dos containers (sempre, para depuração)
+        if: always()
+        run: docker compose logs
+
+      - name: Derrubar a stack
+        if: always()
+        run: docker compose down -v
